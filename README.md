@@ -1,17 +1,16 @@
-# FluxTag (Tag Heatmap and Color Customization)
+# FluxTag (Heatmap and Colored Tags)
+
+Install the Anki addon from [AnkiWeb](https://ankiweb.net/shared/info/1282795184).
 
 ## Description
 
-FluxTag improves the tag sidebar in Anki Browser so tags are easier to scan:
+FluxTag improves the tag sidebar in Anki Browser so tags are easier to scan.
 
-- assign colors to specific tags
-- optionally bold colored tags (and parent tags)
-- show a heatmap icon for tag activity
-- show a checkmark on tags that meet a completion threshold
+![Demo GIF showing features of FluxTag for Anki](https://github.com/qais8r/anki-flux-tag/blob/main/assets/demo.gif?raw=true)
 
 ## Features
 
-In the Browser tag tree, FluxTag adds a tag heatmap. It displays a colored circle icon based on an unsuspended-card ratio, and a checkmark overlay for completed tags.
+In the Browser tag tree, FluxTag adds a tag heatmap. It displays a colored circle icon based on an unsuspended-card ratio, and a checkmark overlay for completed tags meeting a specified threshold.
 
 It also allows you to customize tag appearance by changing their color, boldness, and font size.
 
