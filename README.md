@@ -17,6 +17,5 @@ It also allows you to customize tag appearance by changing their color, boldness
 ## Instructions
 
 1. Open `Browse`.
-2. Right-click any tag in the sidebar.
-3. Choose `Assign color` and pick a preset.
-4. Open `Tools -> FluxTag Settings...` to customize behavior and colors.
+2. Right-click any tag in the sidebar and choose `Assign color` and pick a preset. To remove a color, right click the tag and choose `Remove color`.
+3. Open `Tools -> FluxTag Settings...` to customize behavior and colors.
