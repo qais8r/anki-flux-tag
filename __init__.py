@@ -62,8 +62,8 @@ DEFAULT_COLOR_OPTIONS = {
 }
 
 DEFAULT_HEATMAP_CUSTOM_STOPS = {
-    "dark": {"low": "#FF1800", "mid": "#FFDF00", "high": "#00DB42"},
-    "light": {"low": "#DF0E00", "mid": "#DAB63E", "high": "#4DB359"},
+    "dark": {"low": "#252525", "mid": "#252525", "high": "#00E108"},
+    "light": {"low": "#F1F1F1", "mid": "#F1F1F1", "high": "#00E108"},
 }
 
 DEFAULT_SETTINGS = {
