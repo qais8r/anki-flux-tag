@@ -4,7 +4,7 @@ from copy import deepcopy
 from collections import defaultdict
 from typing import Any
 
-from aqt import colors, mw
+from aqt import colors, gui_hooks, mw
 from aqt.browser import Browser, SidebarItem, SidebarItemType, SidebarModel, SidebarTreeView
 from aqt.gui_hooks import (
     browser_sidebar_will_show_context_menu,
@@ -12,6 +12,7 @@ from aqt.gui_hooks import (
     collection_did_load,
     main_window_did_init,
 )
+from aqt.operations import QueryOp
 from aqt.qt import (
     QAction,
     QBrush,
@@ -137,6 +138,10 @@ fluxtag_config: dict[str, Any] = {}
 fluxtag_settings: dict[str, Any] = deepcopy(DEFAULT_SETTINGS)
 fluxtag_heatmap: dict[str, dict[str, str]] = {}
 fluxtag_completed_tags: set[str] = set()
+fluxtag_heatmap_cache_mod: int | None = None
+fluxtag_heatmap_dirty = True
+fluxtag_heatmap_epoch = 0
+fluxtag_heatmap_pending_epoch: int | None = None
 settings_action: QAction | None = None
 completed_icon_cache: dict[str, QIcon] = {}
 
@@ -299,21 +304,21 @@ def is_heatmap_enabled() -> bool:
 
 
 def set_heatmap_enabled(enabled: bool, sidebar: SidebarTreeView) -> None:
-    global fluxtag_config, fluxtag_heatmap, fluxtag_completed_tags
+    global fluxtag_config
     fluxtag_config["heatmap_enabled"] = enabled
     update_config(fluxtag_config)
     if enabled:
-        generate_heatmap()
+        invalidate_heatmap_cache(clear_existing=True)
+        schedule_heatmap_rebuild(force=True)
     else:
-        fluxtag_heatmap = {}
-        fluxtag_completed_tags = set()
+        clear_heatmap_cache()
     sidebar.refresh()
 
 
 def refresh_heatmap(sidebar: SidebarTreeView) -> None:
-    generate_heatmap()
-    sidebar.refresh()
-    tooltip("Tag heatmap refreshed!", parent=sidebar.browser)
+    invalidate_heatmap_cache()
+    schedule_heatmap_rebuild(force=True, success_message="Tag heatmap refreshed!")
+    tooltip("Refreshing tag heatmap...", parent=sidebar.browser)
 
 
 def get_heatmap_color_classic(ratio: float) -> str:
@@ -367,50 +372,201 @@ def get_heatmap_for_tag(tag: str) -> dict[str, str] | None:
     return fluxtag_heatmap.get(tag, None)
 
 
-def generate_heatmap() -> None:
-    global fluxtag_heatmap, fluxtag_completed_tags
+def get_heatmap_color_for_settings(ratio: float, dark_mode: bool, settings: dict[str, Any]) -> str:
+    if settings["heatmap_mode"] == "custom":
+        ratio = max(0.0, min(1.0, ratio))
+        stops = settings["heatmap_custom_stops"]["dark" if dark_mode else "light"]
+        low = hex_to_rgb(stops["low"])
+        mid = hex_to_rgb(stops["mid"])
+        high = hex_to_rgb(stops["high"])
+        if ratio >= 0.5:
+            t = (ratio - 0.5) * 2
+            r, g, b = blend_color(mid, high, t)
+        else:
+            t = ratio * 2
+            r, g, b = blend_color(low, mid, t)
+        return f"#{r:02x}{g:02x}{b:02x}"
+    return get_heatmap_color_classic(ratio)
+
+
+def get_collection_mod(col=None) -> int | None:
+    target_col = col or getattr(mw, "col", None)
+    if not target_col:
+        return None
+    try:
+        value = target_col.db.scalar("SELECT mod FROM col")
+    except Exception:
+        return None
+    if value is None:
+        return None
+    return int(value)
+
+
+def invalidate_heatmap_cache(clear_existing: bool = False) -> None:
+    global fluxtag_heatmap, fluxtag_completed_tags, fluxtag_heatmap_cache_mod
+    global fluxtag_heatmap_dirty, fluxtag_heatmap_epoch
+    fluxtag_heatmap_dirty = True
+    fluxtag_heatmap_cache_mod = None
+    fluxtag_heatmap_epoch += 1
+    if clear_existing:
+        fluxtag_heatmap = {}
+        fluxtag_completed_tags = set()
+
+
+def clear_heatmap_cache() -> None:
+    global fluxtag_heatmap, fluxtag_completed_tags, fluxtag_heatmap_cache_mod
+    global fluxtag_heatmap_dirty, fluxtag_heatmap_epoch
     fluxtag_heatmap = {}
     fluxtag_completed_tags = set()
+    fluxtag_heatmap_cache_mod = None
+    fluxtag_heatmap_dirty = False
+    fluxtag_heatmap_epoch += 1
+
+
+def heatmap_cache_needs_refresh() -> bool:
+    if not is_heatmap_enabled():
+        return False
+    if fluxtag_heatmap_dirty or fluxtag_heatmap_cache_mod is None:
+        return True
+    return fluxtag_heatmap_cache_mod != get_collection_mod()
+
+
+def build_heatmap_snapshot(col, settings: dict[str, Any]) -> tuple[dict[str, dict[str, str]], set[str], int | None]:
+    heatmap: dict[str, dict[str, str]] = {}
+    completed_tags: set[str] = set()
 
     total = defaultdict(int)
     unsuspended = defaultdict(int)
     seen_prefixes = set()
 
-    rows = mw.col.db.all(
+    rows = col.db.all(
         """
-        SELECT c.queue, n.tags
-        FROM cards c
-        JOIN notes n ON c.nid = n.id
-    """
+        SELECT
+            n.tags,
+            COUNT(c.id) AS total_cards,
+            SUM(CASE WHEN c.queue != -1 THEN 1 ELSE 0 END) AS unsuspended_cards
+        FROM notes n
+        JOIN cards c ON c.nid = n.id
+        GROUP BY n.id
+        """
     )
 
-    for queue, tagstr in rows:
-        prefixes_for_card = set()
-        for tag in mw.col.tags.split(tagstr):
+    for tagstr, total_cards, unsuspended_cards in rows:
+        prefixes_for_note = set()
+        for tag in col.tags.split(tagstr):
             parts = tag.split("::")
             for i in range(1, len(parts) + 1):
-                prefixes_for_card.add("::".join(parts[:i]))
+                prefixes_for_note.add("::".join(parts[:i]))
 
-        for prefix in prefixes_for_card:
-            total[prefix] += 1
-            if queue != -1:
-                unsuspended[prefix] += 1
+        for prefix in prefixes_for_note:
+            total[prefix] += total_cards
+            unsuspended[prefix] += unsuspended_cards
 
-        seen_prefixes |= prefixes_for_card
+        seen_prefixes |= prefixes_for_note
 
-    all_tags = set(mw.col.tags.all()) | seen_prefixes
-    completed_threshold = fluxtag_settings["completed_ratio_threshold"]
+    all_tags = set(col.tags.all()) | seen_prefixes
+    completed_threshold = settings["completed_ratio_threshold"]
 
     for tag in all_tags:
         tagged_cards = total.get(tag, 0)
         unsusp = unsuspended.get(tag, 0)
         ratio = (unsusp / tagged_cards) if tagged_cards else 0.0
         if tagged_cards and ratio >= completed_threshold:
-            fluxtag_completed_tags.add(tag)
-        fluxtag_heatmap[tag] = {
-            "dark": get_heatmap_color(ratio, dark_mode=True),
-            "light": get_heatmap_color(ratio, dark_mode=False),
+            completed_tags.add(tag)
+        heatmap[tag] = {
+            "dark": get_heatmap_color_for_settings(ratio, dark_mode=True, settings=settings),
+            "light": get_heatmap_color_for_settings(ratio, dark_mode=False, settings=settings),
         }
+    return heatmap, completed_tags, get_collection_mod(col)
+
+
+def generate_heatmap() -> None:
+    global fluxtag_heatmap, fluxtag_completed_tags, fluxtag_heatmap_cache_mod, fluxtag_heatmap_dirty
+    if not mw.col:
+        clear_heatmap_cache()
+        return
+    fluxtag_heatmap, fluxtag_completed_tags, fluxtag_heatmap_cache_mod = build_heatmap_snapshot(
+        mw.col, normalize_settings(fluxtag_settings)
+    )
+    fluxtag_heatmap_dirty = False
+
+
+def on_heatmap_rebuild_success(
+    snapshot: tuple[dict[str, dict[str, str]], set[str], int | None], epoch: int, success_message: str | None
+) -> None:
+    global fluxtag_heatmap, fluxtag_completed_tags, fluxtag_heatmap_cache_mod
+    global fluxtag_heatmap_dirty, fluxtag_heatmap_pending_epoch
+    fluxtag_heatmap_pending_epoch = None
+
+    if epoch != fluxtag_heatmap_epoch or not is_heatmap_enabled():
+        if heatmap_cache_needs_refresh():
+            schedule_heatmap_rebuild()
+        return
+
+    fluxtag_heatmap, fluxtag_completed_tags, fluxtag_heatmap_cache_mod = snapshot
+    fluxtag_heatmap_dirty = False
+    refresh_active_browser_sidebar()
+
+    if heatmap_cache_needs_refresh():
+        invalidate_heatmap_cache()
+        schedule_heatmap_rebuild()
+        return
+
+    if success_message:
+        tooltip(success_message, parent=mw)
+
+
+def on_heatmap_rebuild_failure(exception: Exception, epoch: int) -> None:
+    global fluxtag_heatmap_dirty, fluxtag_heatmap_pending_epoch
+    fluxtag_heatmap_pending_epoch = None
+    if epoch == fluxtag_heatmap_epoch:
+        fluxtag_heatmap_dirty = True
+    raise exception
+
+
+def schedule_heatmap_rebuild(force: bool = False, success_message: str | None = None) -> None:
+    global fluxtag_heatmap_pending_epoch
+    if not mw.col or not is_heatmap_enabled():
+        return
+    if fluxtag_heatmap_pending_epoch is not None:
+        if force:
+            invalidate_heatmap_cache()
+        return
+    if not force and not heatmap_cache_needs_refresh():
+        return
+
+    epoch = fluxtag_heatmap_epoch
+    fluxtag_heatmap_pending_epoch = epoch
+    settings_snapshot = normalize_settings(fluxtag_settings)
+    (
+        QueryOp(
+            parent=mw,
+            op=lambda col: build_heatmap_snapshot(col, settings_snapshot),
+            success=lambda snapshot: on_heatmap_rebuild_success(snapshot, epoch, success_message),
+        )
+        .failure(lambda exc: on_heatmap_rebuild_failure(exc, epoch))
+        .run_in_background()
+    )
+
+
+def invalidate_heatmap_for_collection_change() -> None:
+    invalidate_heatmap_cache()
+    if getattr(mw, "browser", None):
+        schedule_heatmap_rebuild()
+
+
+def should_invalidate_heatmap_from_changes(changes: Any) -> bool:
+    relevant_flags = (
+        "card",
+        "cards",
+        "note",
+        "notes",
+        "tag",
+        "tags",
+        "card_state",
+        "browser_sidebar",
+    )
+    return any(bool(getattr(changes, name, False)) for name in relevant_flags)
 
 
 class PatchedSidebarItem(SidebarItem):
@@ -984,7 +1140,7 @@ class FluxTagConfigDialog(QDialog):
         self.settings["heatmap_mode"] = self.cmb_heatmap_mode.currentData()
 
     def accept(self) -> None:
-        global fluxtag_config, fluxtag_settings, fluxtag_heatmap, fluxtag_completed_tags
+        global fluxtag_config, fluxtag_settings
         self.save_controls_into_settings()
 
         fluxtag_settings = normalize_settings(self.settings)
@@ -993,10 +1149,10 @@ class FluxTagConfigDialog(QDialog):
         update_config(fluxtag_config)
 
         if fluxtag_config["heatmap_enabled"]:
-            generate_heatmap()
+            invalidate_heatmap_cache()
+            schedule_heatmap_rebuild(force=True)
         else:
-            fluxtag_heatmap = {}
-            fluxtag_completed_tags = set()
+            clear_heatmap_cache()
 
         refresh_active_browser_sidebar()
         tooltip("FluxTag settings saved.", parent=mw)
@@ -1044,12 +1200,18 @@ def on_browser_sidebar_will_show_context_menu(
 
 def on_browser_will_show(browser: Browser) -> None:
     load_runtime_state()
-    if is_heatmap_enabled():
-        generate_heatmap()
+    schedule_heatmap_rebuild()
 
 
 def on_collection_did_load(col) -> None:
     load_runtime_state()
+    invalidate_heatmap_cache(clear_existing=True)
+
+
+def on_operation_did_execute(*args: Any) -> None:
+    changes = args[0] if args else None
+    if changes is not None and should_invalidate_heatmap_from_changes(changes):
+        invalidate_heatmap_for_collection_change()
 
 
 def on_main_window_did_init(*_args: Any, **_kwargs: Any) -> None:
@@ -1067,3 +1229,6 @@ browser_sidebar_will_show_context_menu.append(on_browser_sidebar_will_show_conte
 browser_will_show.append(on_browser_will_show)
 collection_did_load.append(on_collection_did_load)
 main_window_did_init.append(on_main_window_did_init)
+operation_did_execute_hook = getattr(gui_hooks, "operation_did_execute", None)
+if operation_did_execute_hook is not None:
+    operation_did_execute_hook.append(on_operation_did_execute)
