@@ -139,7 +139,6 @@ fluxtag_config: dict[str, Any] = {}
 fluxtag_settings: dict[str, Any] = deepcopy(DEFAULT_SETTINGS)
 fluxtag_heatmap: dict[str, dict[str, str]] = {}
 fluxtag_completed_tags: set[str] = set()
-fluxtag_heatmap_cache_mod: int | None = None
 fluxtag_heatmap_dirty = True
 fluxtag_heatmap_epoch = 0
 fluxtag_heatmap_pending_epoch: int | None = None
@@ -405,24 +404,10 @@ def get_heatmap_color_for_palette(ratio: float, dark_mode: bool, palette: dict[s
     return get_heatmap_color_classic(ratio)
 
 
-def get_collection_mod(col=None) -> int | None:
-    target_col = col or getattr(mw, "col", None)
-    if not target_col:
-        return None
-    try:
-        value = target_col.db.scalar("SELECT mod FROM col")
-    except Exception:
-        return None
-    if value is None:
-        return None
-    return int(value)
-
-
 def invalidate_heatmap_cache(clear_existing: bool = False) -> None:
-    global fluxtag_heatmap, fluxtag_completed_tags, fluxtag_heatmap_cache_mod
+    global fluxtag_heatmap, fluxtag_completed_tags
     global fluxtag_heatmap_dirty, fluxtag_heatmap_epoch
     fluxtag_heatmap_dirty = True
-    fluxtag_heatmap_cache_mod = None
     fluxtag_heatmap_epoch += 1
     if clear_existing:
         fluxtag_heatmap = {}
@@ -430,11 +415,10 @@ def invalidate_heatmap_cache(clear_existing: bool = False) -> None:
 
 
 def clear_heatmap_cache() -> None:
-    global fluxtag_heatmap, fluxtag_completed_tags, fluxtag_heatmap_cache_mod
+    global fluxtag_heatmap, fluxtag_completed_tags
     global fluxtag_heatmap_dirty, fluxtag_heatmap_epoch
     fluxtag_heatmap = {}
     fluxtag_completed_tags = set()
-    fluxtag_heatmap_cache_mod = None
     fluxtag_heatmap_dirty = False
     fluxtag_heatmap_epoch += 1
     stop_heatmap_rebuild_timer()
@@ -443,12 +427,10 @@ def clear_heatmap_cache() -> None:
 def heatmap_cache_needs_refresh() -> bool:
     if not is_heatmap_enabled():
         return False
-    if fluxtag_heatmap_dirty or fluxtag_heatmap_cache_mod is None:
-        return True
-    return fluxtag_heatmap_cache_mod != get_collection_mod()
+    return fluxtag_heatmap_dirty
 
 
-def build_heatmap_snapshot(col, settings: dict[str, Any]) -> tuple[dict[str, dict[str, str]], set[str], int | None]:
+def build_heatmap_snapshot(col, settings: dict[str, Any]) -> tuple[dict[str, dict[str, str]], set[str]]:
     heatmap: dict[str, dict[str, str]] = {}
     completed_tags: set[str] = set()
     palette = build_heatmap_palette(settings)
@@ -499,24 +481,22 @@ def build_heatmap_snapshot(col, settings: dict[str, Any]) -> tuple[dict[str, dic
             "dark": get_heatmap_color_for_palette(ratio, dark_mode=True, palette=palette),
             "light": get_heatmap_color_for_palette(ratio, dark_mode=False, palette=palette),
         }
-    return heatmap, completed_tags, get_collection_mod(col)
+    return heatmap, completed_tags
 
 
 def generate_heatmap() -> None:
-    global fluxtag_heatmap, fluxtag_completed_tags, fluxtag_heatmap_cache_mod, fluxtag_heatmap_dirty
+    global fluxtag_heatmap, fluxtag_completed_tags, fluxtag_heatmap_dirty
     if not mw.col:
         clear_heatmap_cache()
         return
-    fluxtag_heatmap, fluxtag_completed_tags, fluxtag_heatmap_cache_mod = build_heatmap_snapshot(
-        mw.col, normalize_settings(fluxtag_settings)
-    )
+    fluxtag_heatmap, fluxtag_completed_tags = build_heatmap_snapshot(mw.col, normalize_settings(fluxtag_settings))
     fluxtag_heatmap_dirty = False
 
 
 def on_heatmap_rebuild_success(
-    snapshot: tuple[dict[str, dict[str, str]], set[str], int | None], epoch: int, success_message: str | None
+    snapshot: tuple[dict[str, dict[str, str]], set[str]], epoch: int, success_message: str | None
 ) -> None:
-    global fluxtag_heatmap, fluxtag_completed_tags, fluxtag_heatmap_cache_mod
+    global fluxtag_heatmap, fluxtag_completed_tags
     global fluxtag_heatmap_dirty, fluxtag_heatmap_pending_epoch
     fluxtag_heatmap_pending_epoch = None
 
@@ -525,7 +505,7 @@ def on_heatmap_rebuild_success(
             schedule_heatmap_rebuild()
         return
 
-    fluxtag_heatmap, fluxtag_completed_tags, fluxtag_heatmap_cache_mod = snapshot
+    fluxtag_heatmap, fluxtag_completed_tags = snapshot
     fluxtag_heatmap_dirty = False
     refresh_active_browser_sidebar()
 
