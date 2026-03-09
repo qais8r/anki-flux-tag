@@ -582,9 +582,8 @@ def should_invalidate_heatmap_from_changes(changes: Any) -> bool:
         "suspension",
         "suspended",
     )
-    available_specific_flags = [name for name in specific_flags if hasattr(changes, name)]
-    if available_specific_flags:
-        return any(bool(getattr(changes, name, False)) for name in available_specific_flags)
+    if any(bool(getattr(changes, name, False)) for name in specific_flags if hasattr(changes, name)):
+        return True
 
     fallback_flags = (
         "card",
