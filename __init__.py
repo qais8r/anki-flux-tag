@@ -35,6 +35,7 @@ from aqt.qt import (
     QPushButton,
     QSpinBox,
     QTabWidget,
+    QTimer,
     QTreeWidget,
     QTreeWidgetItem,
     Qt,
@@ -142,8 +143,11 @@ fluxtag_heatmap_cache_mod: int | None = None
 fluxtag_heatmap_dirty = True
 fluxtag_heatmap_epoch = 0
 fluxtag_heatmap_pending_epoch: int | None = None
+heatmap_rebuild_timer: QTimer | None = None
 settings_action: QAction | None = None
 completed_icon_cache: dict[str, QIcon] = {}
+
+HEATMAP_REBUILD_DEBOUNCE_MS = 250
 
 
 def normalize_bool(value: Any, default: bool) -> bool:
@@ -347,12 +351,10 @@ def hex_to_rgb(color: str) -> tuple[int, int, int]:
     return (qcolor.red(), qcolor.green(), qcolor.blue())
 
 
-def get_heatmap_color_custom(ratio: float, dark_mode: bool) -> str:
+def blend_heatmap_stops(
+    ratio: float, low: tuple[int, int, int], mid: tuple[int, int, int], high: tuple[int, int, int]
+) -> str:
     ratio = max(0.0, min(1.0, ratio))
-    stops = fluxtag_settings["heatmap_custom_stops"]["dark" if dark_mode else "light"]
-    low = hex_to_rgb(stops["low"])
-    mid = hex_to_rgb(stops["mid"])
-    high = hex_to_rgb(stops["high"])
     if ratio >= 0.5:
         t = (ratio - 0.5) * 2
         r, g, b = blend_color(mid, high, t)
@@ -360,6 +362,16 @@ def get_heatmap_color_custom(ratio: float, dark_mode: bool) -> str:
         t = ratio * 2
         r, g, b = blend_color(low, mid, t)
     return f"#{r:02x}{g:02x}{b:02x}"
+
+
+def get_heatmap_color_custom(ratio: float, dark_mode: bool) -> str:
+    stops = fluxtag_settings["heatmap_custom_stops"]["dark" if dark_mode else "light"]
+    return blend_heatmap_stops(
+        ratio,
+        hex_to_rgb(stops["low"]),
+        hex_to_rgb(stops["mid"]),
+        hex_to_rgb(stops["high"]),
+    )
 
 
 def get_heatmap_color(ratio: float, dark_mode: bool) -> str:
@@ -372,20 +384,24 @@ def get_heatmap_for_tag(tag: str) -> dict[str, str] | None:
     return fluxtag_heatmap.get(tag, None)
 
 
-def get_heatmap_color_for_settings(ratio: float, dark_mode: bool, settings: dict[str, Any]) -> str:
-    if settings["heatmap_mode"] == "custom":
-        ratio = max(0.0, min(1.0, ratio))
-        stops = settings["heatmap_custom_stops"]["dark" if dark_mode else "light"]
-        low = hex_to_rgb(stops["low"])
-        mid = hex_to_rgb(stops["mid"])
-        high = hex_to_rgb(stops["high"])
-        if ratio >= 0.5:
-            t = (ratio - 0.5) * 2
-            r, g, b = blend_color(mid, high, t)
-        else:
-            t = ratio * 2
-            r, g, b = blend_color(low, mid, t)
-        return f"#{r:02x}{g:02x}{b:02x}"
+def build_heatmap_palette(settings: dict[str, Any]) -> dict[str, Any]:
+    if settings["heatmap_mode"] != "custom":
+        return {"mode": "classic"}
+    palette: dict[str, Any] = {"mode": "custom"}
+    for theme in THEMES:
+        stops = settings["heatmap_custom_stops"][theme]
+        palette[theme] = (
+            hex_to_rgb(stops["low"]),
+            hex_to_rgb(stops["mid"]),
+            hex_to_rgb(stops["high"]),
+        )
+    return palette
+
+
+def get_heatmap_color_for_palette(ratio: float, dark_mode: bool, palette: dict[str, Any]) -> str:
+    if palette["mode"] == "custom":
+        low, mid, high = palette["dark" if dark_mode else "light"]
+        return blend_heatmap_stops(ratio, low, mid, high)
     return get_heatmap_color_classic(ratio)
 
 
@@ -421,6 +437,7 @@ def clear_heatmap_cache() -> None:
     fluxtag_heatmap_cache_mod = None
     fluxtag_heatmap_dirty = False
     fluxtag_heatmap_epoch += 1
+    stop_heatmap_rebuild_timer()
 
 
 def heatmap_cache_needs_refresh() -> bool:
@@ -434,10 +451,12 @@ def heatmap_cache_needs_refresh() -> bool:
 def build_heatmap_snapshot(col, settings: dict[str, Any]) -> tuple[dict[str, dict[str, str]], set[str], int | None]:
     heatmap: dict[str, dict[str, str]] = {}
     completed_tags: set[str] = set()
+    palette = build_heatmap_palette(settings)
 
     total = defaultdict(int)
     unsuspended = defaultdict(int)
     seen_prefixes = set()
+    tag_prefix_cache: dict[str, tuple[str, ...]] = {}
 
     rows = col.db.all(
         """
@@ -447,22 +466,25 @@ def build_heatmap_snapshot(col, settings: dict[str, Any]) -> tuple[dict[str, dic
             SUM(CASE WHEN c.queue != -1 THEN 1 ELSE 0 END) AS unsuspended_cards
         FROM notes n
         JOIN cards c ON c.nid = n.id
-        GROUP BY n.id
+        GROUP BY n.tags
         """
     )
 
     for tagstr, total_cards, unsuspended_cards in rows:
-        prefixes_for_note = set()
+        prefixes_for_tagset = set()
         for tag in col.tags.split(tagstr):
-            parts = tag.split("::")
-            for i in range(1, len(parts) + 1):
-                prefixes_for_note.add("::".join(parts[:i]))
+            prefixes = tag_prefix_cache.get(tag)
+            if prefixes is None:
+                parts = tag.split("::")
+                prefixes = tuple("::".join(parts[:i]) for i in range(1, len(parts) + 1))
+                tag_prefix_cache[tag] = prefixes
+            prefixes_for_tagset.update(prefixes)
 
-        for prefix in prefixes_for_note:
+        for prefix in prefixes_for_tagset:
             total[prefix] += total_cards
             unsuspended[prefix] += unsuspended_cards
 
-        seen_prefixes |= prefixes_for_note
+        seen_prefixes |= prefixes_for_tagset
 
     all_tags = set(col.tags.all()) | seen_prefixes
     completed_threshold = settings["completed_ratio_threshold"]
@@ -474,8 +496,8 @@ def build_heatmap_snapshot(col, settings: dict[str, Any]) -> tuple[dict[str, dic
         if tagged_cards and ratio >= completed_threshold:
             completed_tags.add(tag)
         heatmap[tag] = {
-            "dark": get_heatmap_color_for_settings(ratio, dark_mode=True, settings=settings),
-            "light": get_heatmap_color_for_settings(ratio, dark_mode=False, settings=settings),
+            "dark": get_heatmap_color_for_palette(ratio, dark_mode=True, palette=palette),
+            "light": get_heatmap_color_for_palette(ratio, dark_mode=False, palette=palette),
         }
     return heatmap, completed_tags, get_collection_mod(col)
 
@@ -549,24 +571,48 @@ def schedule_heatmap_rebuild(force: bool = False, success_message: str | None = 
     )
 
 
+def stop_heatmap_rebuild_timer() -> None:
+    if heatmap_rebuild_timer is not None and heatmap_rebuild_timer.isActive():
+        heatmap_rebuild_timer.stop()
+
+
+def debounce_heatmap_rebuild(delay_ms: int = HEATMAP_REBUILD_DEBOUNCE_MS) -> None:
+    global heatmap_rebuild_timer
+    if not mw.col or not is_heatmap_enabled():
+        return
+    if heatmap_rebuild_timer is None:
+        heatmap_rebuild_timer = QTimer(mw)
+        heatmap_rebuild_timer.setSingleShot(True)
+        heatmap_rebuild_timer.timeout.connect(schedule_heatmap_rebuild)
+    heatmap_rebuild_timer.start(delay_ms)
+
+
 def invalidate_heatmap_for_collection_change() -> None:
     invalidate_heatmap_cache()
     if getattr(mw, "browser", None):
-        schedule_heatmap_rebuild()
+        debounce_heatmap_rebuild()
 
 
 def should_invalidate_heatmap_from_changes(changes: Any) -> bool:
-    relevant_flags = (
-        "card",
-        "cards",
-        "note",
-        "notes",
+    specific_flags = (
         "tag",
         "tags",
         "card_state",
         "browser_sidebar",
+        "suspension",
+        "suspended",
     )
-    return any(bool(getattr(changes, name, False)) for name in relevant_flags)
+    available_specific_flags = [name for name in specific_flags if hasattr(changes, name)]
+    if available_specific_flags:
+        return any(bool(getattr(changes, name, False)) for name in available_specific_flags)
+
+    fallback_flags = (
+        "card",
+        "cards",
+        "note",
+        "notes",
+    )
+    return any(bool(getattr(changes, name, False)) for name in fallback_flags)
 
 
 class PatchedSidebarItem(SidebarItem):
