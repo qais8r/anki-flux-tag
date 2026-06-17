@@ -147,6 +147,7 @@ settings_action: QAction | None = None
 completed_icon_cache: dict[str, QIcon] = {}
 
 HEATMAP_REBUILD_DEBOUNCE_MS = 250
+BROWSER_OPEN_HEATMAP_REBUILD_DELAY_MS = 1200
 
 
 def normalize_bool(value: Any, default: bool) -> bool:
@@ -565,6 +566,12 @@ def debounce_heatmap_rebuild(delay_ms: int = HEATMAP_REBUILD_DEBOUNCE_MS) -> Non
         heatmap_rebuild_timer.setSingleShot(True)
         heatmap_rebuild_timer.timeout.connect(schedule_heatmap_rebuild)
     heatmap_rebuild_timer.start(delay_ms)
+
+
+def defer_heatmap_rebuild_after_browser_open() -> None:
+    if not mw.col or not is_heatmap_enabled() or not heatmap_cache_needs_refresh():
+        return
+    QTimer.singleShot(BROWSER_OPEN_HEATMAP_REBUILD_DELAY_MS, schedule_heatmap_rebuild)
 
 
 def invalidate_heatmap_for_collection_change() -> None:
@@ -1225,7 +1232,7 @@ def on_browser_sidebar_will_show_context_menu(
 
 def on_browser_will_show(browser: Browser) -> None:
     load_runtime_state()
-    schedule_heatmap_rebuild()
+    defer_heatmap_rebuild_after_browser_open()
 
 
 def on_collection_did_load(col) -> None:
