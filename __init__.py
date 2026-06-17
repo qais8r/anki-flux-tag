@@ -142,9 +142,11 @@ fluxtag_completed_tags: set[str] = set()
 fluxtag_heatmap_dirty = True
 fluxtag_heatmap_epoch = 0
 fluxtag_heatmap_pending_epoch: int | None = None
+fluxtag_heatmap_queued_success_message: str | None = None
 heatmap_rebuild_timer: QTimer | None = None
 settings_action: QAction | None = None
 completed_icon_cache: dict[str, QIcon] = {}
+active_browser: Browser | None = None
 
 HEATMAP_REBUILD_DEBOUNCE_MS = 250
 BROWSER_OPEN_HEATMAP_REBUILD_DELAY_MS = 1200
@@ -265,12 +267,21 @@ def theme_color(colors_by_theme: dict[str, str]) -> str:
 
 
 def refresh_active_browser_sidebar() -> None:
-    browser = getattr(mw, "browser", None)
+    browser = active_browser or getattr(mw, "browser", None)
     if not browser:
         return
     sidebar = getattr(browser, "sidebarTree", None)
     if sidebar:
-        sidebar.refresh()
+        try:
+            sidebar.refresh()
+        except RuntimeError:
+            clear_active_browser(id(browser))
+
+
+def clear_active_browser(browser_id: int) -> None:
+    global active_browser
+    if active_browser is not None and id(active_browser) == browser_id:
+        active_browser = None
 
 
 def has_custom_color(tag: str) -> bool:
@@ -498,12 +509,14 @@ def on_heatmap_rebuild_success(
     snapshot: tuple[dict[str, dict[str, str]], set[str]], epoch: int, success_message: str | None
 ) -> None:
     global fluxtag_heatmap, fluxtag_completed_tags
-    global fluxtag_heatmap_dirty, fluxtag_heatmap_pending_epoch
+    global fluxtag_heatmap_dirty, fluxtag_heatmap_pending_epoch, fluxtag_heatmap_queued_success_message
     fluxtag_heatmap_pending_epoch = None
 
     if epoch != fluxtag_heatmap_epoch or not is_heatmap_enabled():
         if heatmap_cache_needs_refresh():
-            schedule_heatmap_rebuild()
+            queued_success_message = fluxtag_heatmap_queued_success_message
+            fluxtag_heatmap_queued_success_message = None
+            schedule_heatmap_rebuild(success_message=queued_success_message)
         return
 
     fluxtag_heatmap, fluxtag_completed_tags = snapshot
@@ -520,20 +533,22 @@ def on_heatmap_rebuild_success(
 
 
 def on_heatmap_rebuild_failure(exception: Exception, epoch: int) -> None:
-    global fluxtag_heatmap_dirty, fluxtag_heatmap_pending_epoch
+    global fluxtag_heatmap_dirty, fluxtag_heatmap_pending_epoch, fluxtag_heatmap_queued_success_message
     fluxtag_heatmap_pending_epoch = None
+    fluxtag_heatmap_queued_success_message = None
     if epoch == fluxtag_heatmap_epoch:
         fluxtag_heatmap_dirty = True
     raise exception
 
 
 def schedule_heatmap_rebuild(force: bool = False, success_message: str | None = None) -> None:
-    global fluxtag_heatmap_pending_epoch
+    global fluxtag_heatmap_pending_epoch, fluxtag_heatmap_queued_success_message
     if not mw.col or not is_heatmap_enabled():
         return
     if fluxtag_heatmap_pending_epoch is not None:
         if force:
             invalidate_heatmap_cache()
+            fluxtag_heatmap_queued_success_message = success_message
         return
     if not force and not heatmap_cache_needs_refresh():
         return
@@ -1231,6 +1246,9 @@ def on_browser_sidebar_will_show_context_menu(
 
 
 def on_browser_will_show(browser: Browser) -> None:
+    global active_browser
+    active_browser = browser
+    browser.destroyed.connect(lambda _obj=None, browser_id=id(browser): clear_active_browser(browser_id))
     load_runtime_state()
     defer_heatmap_rebuild_after_browser_open()
 
