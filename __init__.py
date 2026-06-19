@@ -144,12 +144,14 @@ fluxtag_heatmap_epoch = 0
 fluxtag_heatmap_pending_epoch: int | None = None
 fluxtag_heatmap_queued_success_message: str | None = None
 heatmap_rebuild_timer: QTimer | None = None
+browser_open_heatmap_rebuild_timer: QTimer | None = None
 settings_action: QAction | None = None
 completed_icon_cache: dict[str, QIcon] = {}
 active_browser: Browser | None = None
 
 HEATMAP_REBUILD_DEBOUNCE_MS = 250
 BROWSER_OPEN_HEATMAP_REBUILD_DELAY_MS = 1200
+BROWSER_OPEN_HEATMAP_REBUILD_RETRY_MS = 750
 
 
 def normalize_bool(value: Any, default: bool) -> bool:
@@ -282,6 +284,7 @@ def clear_active_browser(browser_id: int) -> None:
     global active_browser
     if active_browser is not None and id(active_browser) == browser_id:
         active_browser = None
+        stop_browser_open_heatmap_rebuild_timer()
 
 
 def has_custom_color(tag: str) -> bool:
@@ -572,6 +575,18 @@ def stop_heatmap_rebuild_timer() -> None:
         heatmap_rebuild_timer.stop()
 
 
+def stop_browser_open_heatmap_rebuild_timer() -> None:
+    global browser_open_heatmap_rebuild_timer
+    if browser_open_heatmap_rebuild_timer is None:
+        return
+    try:
+        browser_open_heatmap_rebuild_timer.stop()
+        browser_open_heatmap_rebuild_timer.deleteLater()
+    except RuntimeError:
+        pass
+    browser_open_heatmap_rebuild_timer = None
+
+
 def debounce_heatmap_rebuild(delay_ms: int = HEATMAP_REBUILD_DEBOUNCE_MS) -> None:
     global heatmap_rebuild_timer
     if not mw.col or not is_heatmap_enabled():
@@ -583,10 +598,50 @@ def debounce_heatmap_rebuild(delay_ms: int = HEATMAP_REBUILD_DEBOUNCE_MS) -> Non
     heatmap_rebuild_timer.start(delay_ms)
 
 
-def defer_heatmap_rebuild_after_browser_open() -> None:
+def browser_search_field_has_focus(browser: Browser) -> bool:
+    try:
+        search_edit = getattr(browser.form, "searchEdit", None)
+        line_edit = search_edit.lineEdit() if search_edit is not None else None
+        focus = mw.app.focusWidget()
+    except RuntimeError:
+        return False
+
+    if focus is None:
+        return False
+    if focus is search_edit or focus is line_edit:
+        return True
+    if search_edit is not None and search_edit.isAncestorOf(focus):
+        return True
+    return bool(line_edit is not None and line_edit.isAncestorOf(focus))
+
+
+def defer_heatmap_rebuild_after_browser_open(browser: Browser, delay_ms: int = BROWSER_OPEN_HEATMAP_REBUILD_DELAY_MS) -> None:
+    global browser_open_heatmap_rebuild_timer
     if not mw.col or not is_heatmap_enabled() or not heatmap_cache_needs_refresh():
         return
-    QTimer.singleShot(BROWSER_OPEN_HEATMAP_REBUILD_DELAY_MS, schedule_heatmap_rebuild)
+    stop_browser_open_heatmap_rebuild_timer()
+    browser_open_heatmap_rebuild_timer = QTimer(browser)
+    browser_open_heatmap_rebuild_timer.setSingleShot(True)
+    browser_open_heatmap_rebuild_timer.timeout.connect(
+        lambda browser_id=id(browser): maybe_run_browser_open_heatmap_rebuild(browser_id)
+    )
+    browser_open_heatmap_rebuild_timer.start(delay_ms)
+
+
+def maybe_run_browser_open_heatmap_rebuild(browser_id: int) -> None:
+    browser = active_browser
+    if browser is None or id(browser) != browser_id:
+        stop_browser_open_heatmap_rebuild_timer()
+        return
+    if not mw.col or not is_heatmap_enabled() or not heatmap_cache_needs_refresh():
+        stop_browser_open_heatmap_rebuild_timer()
+        return
+    if mw.progress.busy() or browser_search_field_has_focus(browser):
+        defer_heatmap_rebuild_after_browser_open(browser, BROWSER_OPEN_HEATMAP_REBUILD_RETRY_MS)
+        return
+
+    stop_browser_open_heatmap_rebuild_timer()
+    schedule_heatmap_rebuild()
 
 
 def invalidate_heatmap_for_collection_change() -> None:
@@ -1250,7 +1305,7 @@ def on_browser_will_show(browser: Browser) -> None:
     active_browser = browser
     browser.destroyed.connect(lambda _obj=None, browser_id=id(browser): clear_active_browser(browser_id))
     load_runtime_state()
-    defer_heatmap_rebuild_after_browser_open()
+    defer_heatmap_rebuild_after_browser_open(browser)
 
 
 def on_collection_did_load(col) -> None:
