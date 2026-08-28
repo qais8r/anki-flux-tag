@@ -4,6 +4,7 @@ from copy import deepcopy
 from collections import defaultdict
 from typing import Any
 
+from anki.collection import Collection
 from aqt import colors, gui_hooks, mw
 from aqt.browser import Browser, SidebarItem, SidebarItemType, SidebarModel, SidebarTreeView
 from aqt.gui_hooks import (
@@ -144,14 +145,14 @@ fluxtag_heatmap_epoch = 0
 fluxtag_heatmap_pending_epoch: int | None = None
 fluxtag_heatmap_queued_success_message: str | None = None
 heatmap_rebuild_timer: QTimer | None = None
-browser_open_heatmap_rebuild_timer: QTimer | None = None
 settings_action: QAction | None = None
 completed_icon_cache: dict[str, QIcon] = {}
+heatmap_icon_cache: dict[tuple[bool, str, str], QIcon] = {}
 active_browser: Browser | None = None
+original_sidebar_item_add_child = SidebarItem.add_child
+original_sidebar_model_data = SidebarModel.data
 
 HEATMAP_REBUILD_DEBOUNCE_MS = 250
-BROWSER_OPEN_HEATMAP_REBUILD_DELAY_MS = 1200
-BROWSER_OPEN_HEATMAP_REBUILD_RETRY_MS = 750
 
 
 def normalize_bool(value: Any, default: bool) -> bool:
@@ -284,7 +285,6 @@ def clear_active_browser(browser_id: int) -> None:
     global active_browser
     if active_browser is not None and id(active_browser) == browser_id:
         active_browser = None
-        stop_browser_open_heatmap_rebuild_timer()
 
 
 def has_custom_color(tag: str) -> bool:
@@ -361,8 +361,8 @@ def blend_color(start: tuple[int, int, int], end: tuple[int, int, int], t: float
 
 
 def hex_to_rgb(color: str) -> tuple[int, int, int]:
-    qcolor = QColor(color)
-    return (qcolor.red(), qcolor.green(), qcolor.blue())
+    value = color.removeprefix("#")
+    return tuple(int(value[offset : offset + 2], 16) for offset in (0, 2, 4))
 
 
 def blend_heatmap_stops(
@@ -376,22 +376,6 @@ def blend_heatmap_stops(
         t = ratio * 2
         r, g, b = blend_color(low, mid, t)
     return f"#{r:02x}{g:02x}{b:02x}"
-
-
-def get_heatmap_color_custom(ratio: float, dark_mode: bool) -> str:
-    stops = fluxtag_settings["heatmap_custom_stops"]["dark" if dark_mode else "light"]
-    return blend_heatmap_stops(
-        ratio,
-        hex_to_rgb(stops["low"]),
-        hex_to_rgb(stops["mid"]),
-        hex_to_rgb(stops["high"]),
-    )
-
-
-def get_heatmap_color(ratio: float, dark_mode: bool) -> str:
-    if fluxtag_settings["heatmap_mode"] == "custom":
-        return get_heatmap_color_custom(ratio, dark_mode)
-    return get_heatmap_color_classic(ratio)
 
 
 def get_heatmap_for_tag(tag: str) -> dict[str, str] | None:
@@ -445,67 +429,72 @@ def heatmap_cache_needs_refresh() -> bool:
     return fluxtag_heatmap_dirty
 
 
-def build_heatmap_snapshot(col, settings: dict[str, Any]) -> tuple[dict[str, dict[str, str]], set[str]]:
+def build_heatmap_snapshot(
+    col: Collection, settings: dict[str, Any]
+) -> tuple[dict[str, dict[str, str]], set[str]]:
     heatmap: dict[str, dict[str, str]] = {}
     completed_tags: set[str] = set()
     palette = build_heatmap_palette(settings)
 
     total = defaultdict(int)
     unsuspended = defaultdict(int)
-    seen_prefixes = set()
     tag_prefix_cache: dict[str, tuple[str, ...]] = {}
 
+    registered_tags = set(col.db.list("SELECT tag FROM tags"))
     rows = col.db.all(
         """
-        SELECT
-            n.tags,
-            COUNT(c.id) AS total_cards,
-            SUM(CASE WHEN c.queue != -1 THEN 1 ELSE 0 END) AS unsuspended_cards
+        SELECT n.tags, COUNT(c.id), SUM(c.queue != -1)
         FROM notes n
         JOIN cards c ON c.nid = n.id
-        GROUP BY n.tags
+        GROUP BY n.id
         """
     )
 
     for tagstr, total_cards, unsuspended_cards in rows:
-        prefixes_for_tagset = set()
-        for tag in col.tags.split(tagstr):
+        prefixes_for_note = set()
+        for tag in tagstr.split():
             prefixes = tag_prefix_cache.get(tag)
             if prefixes is None:
                 parts = tag.split("::")
                 prefixes = tuple("::".join(parts[:i]) for i in range(1, len(parts) + 1))
                 tag_prefix_cache[tag] = prefixes
-            prefixes_for_tagset.update(prefixes)
+            prefixes_for_note.update(prefixes)
 
-        for prefix in prefixes_for_tagset:
+        for prefix in prefixes_for_note:
             total[prefix] += total_cards
             unsuspended[prefix] += unsuspended_cards
 
-        seen_prefixes |= prefixes_for_tagset
-
-    all_tags = set(col.tags.all()) | seen_prefixes
     completed_threshold = settings["completed_ratio_threshold"]
+    color_cache: dict[float, dict[str, str]] = {}
 
-    for tag in all_tags:
+    for tag in registered_tags | total.keys():
         tagged_cards = total.get(tag, 0)
         unsusp = unsuspended.get(tag, 0)
         ratio = (unsusp / tagged_cards) if tagged_cards else 0.0
         if tagged_cards and ratio >= completed_threshold:
             completed_tags.add(tag)
-        heatmap[tag] = {
-            "dark": get_heatmap_color_for_palette(ratio, dark_mode=True, palette=palette),
-            "light": get_heatmap_color_for_palette(ratio, dark_mode=False, palette=palette),
-        }
+        colors = color_cache.get(ratio)
+        if colors is None:
+            dark = get_heatmap_color_for_palette(ratio, dark_mode=True, palette=palette)
+            light = (
+                get_heatmap_color_for_palette(ratio, dark_mode=False, palette=palette)
+                if palette["mode"] == "custom"
+                else dark
+            )
+            colors = {"dark": dark, "light": light}
+            color_cache[ratio] = colors
+        heatmap[tag] = colors
     return heatmap, completed_tags
 
 
-def generate_heatmap() -> None:
-    global fluxtag_heatmap, fluxtag_completed_tags, fluxtag_heatmap_dirty
-    if not mw.col:
-        clear_heatmap_cache()
-        return
-    fluxtag_heatmap, fluxtag_completed_tags = build_heatmap_snapshot(mw.col, normalize_settings(fluxtag_settings))
-    fluxtag_heatmap_dirty = False
+def update_active_browser_heatmap() -> None:
+    browser = active_browser or getattr(mw, "browser", None)
+    sidebar = getattr(browser, "sidebarTree", None) if browser else None
+    if sidebar:
+        try:
+            sidebar.viewport().update()
+        except RuntimeError:
+            clear_active_browser(id(browser))
 
 
 def on_heatmap_rebuild_success(
@@ -524,12 +513,9 @@ def on_heatmap_rebuild_success(
 
     fluxtag_heatmap, fluxtag_completed_tags = snapshot
     fluxtag_heatmap_dirty = False
-    refresh_active_browser_sidebar()
-
-    if heatmap_cache_needs_refresh():
-        invalidate_heatmap_cache()
-        schedule_heatmap_rebuild()
-        return
+    completed_icon_cache.clear()
+    heatmap_icon_cache.clear()
+    update_active_browser_heatmap()
 
     if success_message:
         tooltip(success_message, parent=mw)
@@ -538,9 +524,14 @@ def on_heatmap_rebuild_success(
 def on_heatmap_rebuild_failure(exception: Exception, epoch: int) -> None:
     global fluxtag_heatmap_dirty, fluxtag_heatmap_pending_epoch, fluxtag_heatmap_queued_success_message
     fluxtag_heatmap_pending_epoch = None
+    if epoch != fluxtag_heatmap_epoch:
+        success_message = fluxtag_heatmap_queued_success_message
+        fluxtag_heatmap_queued_success_message = None
+        schedule_heatmap_rebuild(success_message=success_message)
+        return
+
     fluxtag_heatmap_queued_success_message = None
-    if epoch == fluxtag_heatmap_epoch:
-        fluxtag_heatmap_dirty = True
+    fluxtag_heatmap_dirty = True
     raise exception
 
 
@@ -575,18 +566,6 @@ def stop_heatmap_rebuild_timer() -> None:
         heatmap_rebuild_timer.stop()
 
 
-def stop_browser_open_heatmap_rebuild_timer() -> None:
-    global browser_open_heatmap_rebuild_timer
-    if browser_open_heatmap_rebuild_timer is None:
-        return
-    try:
-        browser_open_heatmap_rebuild_timer.stop()
-        browser_open_heatmap_rebuild_timer.deleteLater()
-    except RuntimeError:
-        pass
-    browser_open_heatmap_rebuild_timer = None
-
-
 def debounce_heatmap_rebuild(delay_ms: int = HEATMAP_REBUILD_DEBOUNCE_MS) -> None:
     global heatmap_rebuild_timer
     if not mw.col or not is_heatmap_enabled():
@@ -598,52 +577,6 @@ def debounce_heatmap_rebuild(delay_ms: int = HEATMAP_REBUILD_DEBOUNCE_MS) -> Non
     heatmap_rebuild_timer.start(delay_ms)
 
 
-def browser_search_field_has_focus(browser: Browser) -> bool:
-    try:
-        search_edit = getattr(browser.form, "searchEdit", None)
-        line_edit = search_edit.lineEdit() if search_edit is not None else None
-        focus = mw.app.focusWidget()
-    except RuntimeError:
-        return False
-
-    if focus is None:
-        return False
-    if focus is search_edit or focus is line_edit:
-        return True
-    if search_edit is not None and search_edit.isAncestorOf(focus):
-        return True
-    return bool(line_edit is not None and line_edit.isAncestorOf(focus))
-
-
-def defer_heatmap_rebuild_after_browser_open(browser: Browser, delay_ms: int = BROWSER_OPEN_HEATMAP_REBUILD_DELAY_MS) -> None:
-    global browser_open_heatmap_rebuild_timer
-    if not mw.col or not is_heatmap_enabled() or not heatmap_cache_needs_refresh():
-        return
-    stop_browser_open_heatmap_rebuild_timer()
-    browser_open_heatmap_rebuild_timer = QTimer(browser)
-    browser_open_heatmap_rebuild_timer.setSingleShot(True)
-    browser_open_heatmap_rebuild_timer.timeout.connect(
-        lambda browser_id=id(browser): maybe_run_browser_open_heatmap_rebuild(browser_id)
-    )
-    browser_open_heatmap_rebuild_timer.start(delay_ms)
-
-
-def maybe_run_browser_open_heatmap_rebuild(browser_id: int) -> None:
-    browser = active_browser
-    if browser is None or id(browser) != browser_id:
-        stop_browser_open_heatmap_rebuild_timer()
-        return
-    if not mw.col or not is_heatmap_enabled() or not heatmap_cache_needs_refresh():
-        stop_browser_open_heatmap_rebuild_timer()
-        return
-    if mw.progress.busy() or browser_search_field_has_focus(browser):
-        defer_heatmap_rebuild_after_browser_open(browser, BROWSER_OPEN_HEATMAP_REBUILD_RETRY_MS)
-        return
-
-    stop_browser_open_heatmap_rebuild_timer()
-    schedule_heatmap_rebuild()
-
-
 def invalidate_heatmap_for_collection_change() -> None:
     invalidate_heatmap_cache()
     if getattr(mw, "browser", None):
@@ -651,110 +584,67 @@ def invalidate_heatmap_for_collection_change() -> None:
 
 
 def should_invalidate_heatmap_from_changes(changes: Any) -> bool:
-    specific_flags = (
-        "tag",
-        "tags",
-        "card_state",
-        "browser_sidebar",
-        "suspension",
-        "suspended",
-    )
-    if any(bool(getattr(changes, name, False)) for name in specific_flags if hasattr(changes, name)):
-        return True
-
-    fallback_flags = (
-        "card",
-        "cards",
-        "note",
-        "notes",
-    )
-    return any(bool(getattr(changes, name, False)) for name in fallback_flags)
-
-
-class PatchedSidebarItem(SidebarItem):
-    color: str | None = None
-    bold: bool | None = False
+    return any(bool(getattr(changes, name, False)) for name in ("card", "note", "tag"))
 
 
 def patched_data(self, index: QModelIndex, role: int = Qt.ItemDataRole.DisplayRole) -> QVariant:
-    if not index.isValid():
-        return QVariant()
-
-    if role not in (
-        Qt.ItemDataRole.DisplayRole,
-        Qt.ItemDataRole.DecorationRole,
-        Qt.ItemDataRole.ToolTipRole,
-        Qt.ItemDataRole.EditRole,
-        Qt.ItemDataRole.FontRole,
-        Qt.ItemDataRole.ForegroundRole,
-    ):
-        return QVariant()
-
-    item: PatchedSidebarItem = index.internalPointer()
-
-    if role in (Qt.ItemDataRole.DisplayRole, Qt.ItemDataRole.EditRole):
-        return QVariant(item.name)
-    if role == Qt.ItemDataRole.ToolTipRole:
-        return QVariant(item.tooltip)
-    if role == Qt.ItemDataRole.DecorationRole:
-        if isinstance(item.icon, QIcon):
-            return QVariant(item.icon)
-        return QVariant(theme_manager.icon_from_resources(item.icon))
-
-    if role == Qt.ItemDataRole.FontRole:
-        if item.item_type == SidebarItemType.TAG and item.bold:
+    if index.isValid():
+        item = index.internalPointer()
+        if role == Qt.ItemDataRole.DecorationRole and item.item_type == SidebarItemType.TAG:
+            icon = get_heatmap_icon(item.full_name)
+            if icon is not None:
+                return QVariant(icon)
+        if (
+            role == Qt.ItemDataRole.FontRole
+            and item.item_type == SidebarItemType.TAG
+            and getattr(item, "bold", False)
+        ):
             font = QFont()
             font.setBold(True)
             point_delta = fluxtag_settings["font_size_delta"]
             if point_delta:
                 font.setPointSize(max(1, font.pointSize() + point_delta))
             return QVariant(font)
-
-    if role == Qt.ItemDataRole.ForegroundRole:
         if (
-            item.item_type == SidebarItemType.TAG
-            and item.color
-            and fluxtag_settings["show_assigned_colors"]
+            role == Qt.ItemDataRole.ForegroundRole
+            and item.item_type == SidebarItemType.TAG
+            and getattr(item, "color", None)
         ):
             return QVariant(QColor(item.color))
+    return original_sidebar_model_data(self, index, role)
 
-    return QVariant()
+
+def get_heatmap_icon(tag: str) -> QIcon | None:
+    heatmap_colors = get_heatmap_for_tag(tag)
+    if not heatmap_colors:
+        return None
+    if fluxtag_settings["checkmark_for_completed"] and tag in fluxtag_completed_tags:
+        return get_completed_icon(theme_color(heatmap_colors))
+
+    key = (is_dark_mode(), heatmap_colors["dark"], heatmap_colors["light"])
+    icon = heatmap_icon_cache.get(key)
+    if icon is None:
+        icon = theme_manager.icon_from_resources(circle_icon.with_color(heatmap_colors))
+        heatmap_icon_cache[key] = icon
+    return icon
 
 
-def patched_add_child(self: PatchedSidebarItem, child: PatchedSidebarItem) -> None:
-    child._parent_item = self
-
+def patched_add_child(self: SidebarItem, child: SidebarItem) -> None:
+    original_sidebar_item_add_child(self, child)
     if child.item_type == SidebarItemType.TAG:
         child.color = None
         child.bold = False
 
         custom_color = get_color_for_tag(child.full_name)
         if custom_color:
-            if fluxtag_settings["show_assigned_colors"]:
-                child.color = custom_color
+            child.color = custom_color if fluxtag_settings["show_assigned_colors"] else None
             if fluxtag_settings["bold_assigned_tags"]:
                 child.bold = True
-
                 if fluxtag_settings["bold_parent_tags"]:
-
-                    def bold_parent(parent: PatchedSidebarItem) -> None:
-                        if not (hasattr(parent, "color") or hasattr(parent, "bold")):
-                            return
-
+                    parent = child._parent_item
+                    while parent is not None and parent.item_type == SidebarItemType.TAG:
                         parent.bold = True
-                        if parent._parent_item:
-                            bold_parent(parent._parent_item)
-
-                    bold_parent(self)
-
-        heatmap_colors = get_heatmap_for_tag(child.full_name)
-        if heatmap_colors:
-            if fluxtag_settings["checkmark_for_completed"] and child.full_name in fluxtag_completed_tags:
-                child.icon = get_completed_icon(theme_color(heatmap_colors))
-            else:
-                child.icon = circle_icon.with_color(heatmap_colors)
-
-    self.children.append(child)
+                        parent = parent._parent_item
 
 
 def colored_action(parent: QMenu, text: str, color_by_theme: dict[str, str]) -> QWidgetAction:
@@ -1271,7 +1161,7 @@ def open_fluxtag_settings() -> None:
 
 
 def on_browser_sidebar_will_show_context_menu(
-    sidebar: SidebarTreeView, menu: QMenu, item: PatchedSidebarItem, index: QModelIndex
+    sidebar: SidebarTreeView, menu: QMenu, item: SidebarItem, index: QModelIndex
 ) -> None:
     if item.item_type == SidebarItemType.TAG:
         menu.addSeparator()
@@ -1305,10 +1195,10 @@ def on_browser_will_show(browser: Browser) -> None:
     active_browser = browser
     browser.destroyed.connect(lambda _obj=None, browser_id=id(browser): clear_active_browser(browser_id))
     load_runtime_state()
-    defer_heatmap_rebuild_after_browser_open(browser)
+    schedule_heatmap_rebuild()
 
 
-def on_collection_did_load(col) -> None:
+def on_collection_did_load(_col) -> None:
     load_runtime_state()
     invalidate_heatmap_cache(clear_existing=True)
 
